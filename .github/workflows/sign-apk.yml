@@ -1,0 +1,63 @@
+# language: yaml, file: .github/workflows/sign-apk.yml, runtime: GitHub Actions (ubuntu-latest), target: Android APK
+name: Build and Sign APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-and-sign:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup JDK and Android SDK/NDK
+        uses: android-actions/setup-android@v3
+        with:
+          ndk-version: "26.3.11579264"
+          build-tools-version: "34.0.0"
+
+      - name: Compile ARM64 shared library
+        run: |
+          mkdir -p build/arm64-v8a apk_work/lib/arm64-v8a
+          cmake -S . -B build/arm64-v8a \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-24
+          cmake --build build/arm64-v8a --config Release
+          cp build/arm64-v8a/libff_native.so apk_work/lib/arm64-v8a/
+
+      - name: Repack, zipalign, and sign APK
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y apktool
+          # Place base.apk in repo root or fetch via your pipeline before running apktool d
+          apktool d -f base.apk -o decoded_apk
+          mkdir -p decoded_apk/lib/arm64-v8a
+          cp apk_work/lib/arm64-v8a/libff_native.so decoded_apk/lib/arm64-v8a/
+          # Inject System.loadLibrary("ff_native") in target smali onCreate/init before building
+          apktool b decoded_apk -o unsigned.apk
+
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          "$BUILD_TOOLS/zipalign" -v -p 4 unsigned.apk aligned.apk
+
+          echo "$KEYSTORE_B64" | base64 -d > release.keystore
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks release.keystore \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:$KEYSTORE_PASS" \
+            --key-pass "pass:$KEY_PASS" \
+            --out signed-release.apk \
+            aligned.apk
+          rm -f release.keystore
+
+      - name: Upload signed APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-apk
+          path: signed-release.apk
+          
